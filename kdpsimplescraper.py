@@ -309,7 +309,15 @@ WIKISOURCE_EXCLUDED_NAMESPACES = {
     "file",
     "category",
     "talk",
+    "template",
+    "portal",
 }
+
+WIKISOURCE_TEXT_NOISE = (
+    "retrieved from",
+    "public domain",
+    "categories",
+)
 
 
 def _strip_fragment(url: str) -> str:
@@ -326,6 +334,12 @@ def _ensure_action_render(url: str) -> str:
     return urlunparse(parsed._replace(query=new_query))
 
 
+def _is_wikisource_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    return host == "wikisource.org" or host.endswith(".wikisource.org")
+
+
 def extract_wikisource_chapter_links(html_text: str, base_url: str) -> list[str]:
     soup = BeautifulSoup(html_text, "html.parser")
     container = soup.select_one("#mw-content-text") or soup.select_one("div#content") or soup
@@ -336,7 +350,13 @@ def extract_wikisource_chapter_links(html_text: str, base_url: str) -> list[str]
 
     for a in container.select("a[href]"):
         href = a.get("href", "").strip()
-        if not href.startswith("/wiki/"):
+        if not href:
+            continue
+        if href.startswith("/wiki/"):
+            href = href
+        elif href.startswith(base_root + "/wiki/"):
+            href = href[len(base_root):]
+        else:
             continue
 
         href = _strip_fragment(href)
@@ -357,6 +377,88 @@ def extract_wikisource_chapter_links(html_text: str, base_url: str) -> list[str]
         links.append(abs_url)
 
     return links
+
+
+def _extract_wikisource_title(soup: BeautifulSoup, content: Optional[Tag]) -> str:
+    h1 = soup.find("h1")
+    if h1 and h1.get_text(strip=True):
+        return h1.get_text(" ", strip=True)
+    if content:
+        heading = content.find(["h1", "h2", "h3", "h4", "h5", "h6"])
+        if heading and heading.get_text(strip=True):
+            return heading.get_text(" ", strip=True)
+    title_tag = soup.title.get_text(" ", strip=True) if soup.title else ""
+    return title_tag or "Capítulo"
+
+
+def _clean_wikisource_content(html_text: str, opt: ExtractOptions) -> tuple[str, str]:
+    soup = BeautifulSoup(html_text, "html.parser")
+    content = soup.select_one("#mw-content-text") or soup.select_one("div#content")
+    if content is None:
+        content = soup.body or soup
+
+    for bad in content.select(
+        ".mw-editsection, .toc, #toc, .navbox, .vertical-navbox, .metadata, "
+        ".sistersitebox, .authority-control, .mw-references-wrap, .reflist, "
+        ".reference, .catlinks, #catlinks, .printfooter, .noprint, .ws-noexport, "
+        ".hatnote, .thumb, .gallery, .ambox"
+    ):
+        bad.decompose()
+
+    title = _extract_wikisource_title(soup, content)
+    cleaned = extract_clean_text(str(content), opt)
+    if not cleaned:
+        return title, ""
+
+    lines = []
+    for line in cleaned.splitlines():
+        if any(noise in line.strip().lower() for noise in WIKISOURCE_TEXT_NOISE):
+            continue
+        lines.append(line)
+    filtered = "\n".join(lines).strip()
+    return title, (filtered + "\n" if filtered else "")
+
+
+def _format_wikisource_section(title: str, url: str, body: str) -> str:
+    divider = "============================================================"
+    header = f"\n\n{divider}\n{title}\n{url}\n{divider}\n\n"
+    return f"{header}{body.rstrip()}\n"
+
+
+def _collect_wikisource_chapters(index_url: str, opt: ExtractOptions) -> list[tuple[str, str, str]]:
+    data = fetch_url_bytes(index_url)
+    html_text = decode_html_bytes(data)
+    first_level = extract_wikisource_chapter_links(html_text, index_url)
+    if not first_level:
+        return []
+
+    chapters: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+
+    for link in first_level:
+        if link in seen:
+            continue
+        seen.add(link)
+        render_url = _ensure_action_render(link)
+        volume_html = decode_html_bytes(fetch_url_bytes(render_url))
+        sublinks = extract_wikisource_chapter_links(volume_html, link)
+
+        if len(sublinks) >= 4:
+            for sublink in sublinks:
+                if sublink in seen:
+                    continue
+                seen.add(sublink)
+                sub_render = _ensure_action_render(sublink)
+                chapter_html = decode_html_bytes(fetch_url_bytes(sub_render))
+                title, body = _clean_wikisource_content(chapter_html, opt)
+                if body:
+                    chapters.append((title, sublink, body))
+        else:
+            title, body = _clean_wikisource_content(volume_html, opt)
+            if body:
+                chapters.append((title, link, body))
+
+    return chapters
 
 
 # ------------------------------
@@ -447,13 +549,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cb_poetry.setChecked(True)
         self.cb_br = QtWidgets.QCheckBox("Respetar <br> como salto de línea")
         self.cb_br.setChecked(True)
-        self.cb_wikisource = QtWidgets.QCheckBox("Wikisource: descargar obra completa")
-        self.cb_wikisource.setChecked(False)
+        self.btn_wikisource = GlassButton("Wikisource: Descargar obra completa")
+        self.btn_wikisource.clicked.connect(self.on_download_wikisource)
 
         opt_grid.addWidget(self.cb_pre, 0, 0)
         opt_grid.addWidget(self.cb_poetry, 0, 1)
         opt_grid.addWidget(self.cb_br, 1, 0)
-        opt_grid.addWidget(self.cb_wikisource, 1, 1)
+        opt_grid.addWidget(self.btn_wikisource, 1, 1)
 
         # Preview
         self.preview = QtWidgets.QPlainTextEdit()
@@ -528,6 +630,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_browse.setEnabled(not busy)
         self.btn_convert_file.setEnabled(not busy)
         self.btn_out.setEnabled(not busy)
+        self.btn_wikisource.setEnabled(not busy)
         self.btn_save.setEnabled((not busy) and bool(self._last_text))
         if msg:
             self.status.setText(msg)
@@ -577,10 +680,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status.setText("Pega un URL primero.")
             return
 
-        if self.cb_wikisource.isChecked():
-            self._download_wikisource_work(url)
-            return
-
         self._set_busy(True, "Descargando HTML…")
         QtWidgets.QApplication.processEvents()
 
@@ -601,40 +700,36 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_busy(False, f"Listo. Caracteres: {len(cleaned):,} | Líneas: {cleaned.count(chr(10))}")
         self.btn_save.setEnabled(True)
 
+    def on_download_wikisource(self):
+        url = self.url_edit.text().strip()
+        if not url:
+            self.status.setText("Pega un URL primero.")
+            return
+        if not _is_wikisource_url(url):
+            self.status.setText("Ese URL no parece de Wikisource.")
+            return
+
+        self._download_wikisource_work(url)
+
     def _download_wikisource_work(self, index_url: str) -> None:
         self._set_busy(True, "Descargando índice de Wikisource…")
         QtWidgets.QApplication.processEvents()
 
         try:
-            data = fetch_url_bytes(index_url)
+            chapters = _collect_wikisource_chapters(index_url, self._options())
         except Exception as e:
             self._set_busy(False, f"Fallo descargando índice: {e}")
             return
 
-        html_text = decode_html_bytes(data)
-        chapter_links = extract_wikisource_chapter_links(html_text, index_url)
-        if not chapter_links:
-            self._set_busy(False, "No se encontraron links de capítulos.")
+        if not chapters:
+            self._set_busy(False, "No se encontraron capítulos en Wikisource.")
             return
 
-        chapters: list[str] = []
-        total = len(chapter_links)
-        for idx, link in enumerate(chapter_links, start=1):
-            render_url = _ensure_action_render(link)
-            self._set_busy(True, f"Descargando capítulo {idx}/{total}…")
-            QtWidgets.QApplication.processEvents()
-            try:
-                chapter_bytes = fetch_url_bytes(render_url)
-            except Exception as e:
-                self._set_busy(False, f"Fallo descargando capítulo {idx}: {e}")
-                return
-
-            chapter_html = decode_html_bytes(chapter_bytes)
-            chapter_text = extract_clean_text(chapter_html, self._options())
-            if chapter_text:
-                chapters.append(chapter_text.rstrip())
-
-        combined = "\n\n".join(chapters).strip() + "\n"
+        combined_parts = [
+            _format_wikisource_section(title, url, body)
+            for title, url, body in chapters
+        ]
+        combined = "".join(combined_parts).strip() + "\n"
         self._last_text = combined
         self.preview.setPlainText(combined)
         self._set_busy(False, f"Wikisource completo. Capítulos: {len(chapters)} | Caracteres: {len(combined):,}")
