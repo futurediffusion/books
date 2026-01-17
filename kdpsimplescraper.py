@@ -23,6 +23,7 @@ import pathlib
 import re
 import sys
 import urllib.request
+from urllib.parse import urljoin, urlparse, urlunparse
 from dataclasses import dataclass
 from typing import Optional
 
@@ -302,6 +303,62 @@ def decode_html_bytes(data: bytes) -> str:
     return data.decode("cp1252", errors="replace")
 
 
+WIKISOURCE_EXCLUDED_NAMESPACES = {
+    "special",
+    "help",
+    "file",
+    "category",
+    "talk",
+}
+
+
+def _strip_fragment(url: str) -> str:
+    parsed = urlparse(url)
+    return urlunparse(parsed._replace(fragment=""))
+
+
+def _ensure_action_render(url: str) -> str:
+    parsed = urlparse(url)
+    query = parsed.query
+    if "action=render" in query:
+        return url
+    new_query = f"{query}&action=render" if query else "action=render"
+    return urlunparse(parsed._replace(query=new_query))
+
+
+def extract_wikisource_chapter_links(html_text: str, base_url: str) -> list[str]:
+    soup = BeautifulSoup(html_text, "html.parser")
+    container = soup.select_one("#mw-content-text") or soup.select_one("div#content") or soup
+    base_parsed = urlparse(base_url)
+    base_root = f"{base_parsed.scheme}://{base_parsed.netloc}"
+    links: list[str] = []
+    seen: set[str] = set()
+
+    for a in container.select("a[href]"):
+        href = a.get("href", "").strip()
+        if not href.startswith("/wiki/"):
+            continue
+
+        href = _strip_fragment(href)
+        title = href.split("/wiki/", 1)[-1]
+        if ":" in title:
+            namespace = title.split(":", 1)[0].lower()
+            if namespace in WIKISOURCE_EXCLUDED_NAMESPACES:
+                continue
+
+        abs_url = urljoin(base_root, href)
+        if urlparse(abs_url).netloc != base_parsed.netloc:
+            continue
+        if abs_url in seen:
+            continue
+        if _strip_fragment(abs_url) == _strip_fragment(base_url):
+            continue
+        seen.add(abs_url)
+        links.append(abs_url)
+
+    return links
+
+
 # ------------------------------
 # UI
 # ------------------------------
@@ -390,10 +447,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cb_poetry.setChecked(True)
         self.cb_br = QtWidgets.QCheckBox("Respetar <br> como salto de línea")
         self.cb_br.setChecked(True)
+        self.cb_wikisource = QtWidgets.QCheckBox("Wikisource: descargar obra completa")
+        self.cb_wikisource.setChecked(False)
 
         opt_grid.addWidget(self.cb_pre, 0, 0)
         opt_grid.addWidget(self.cb_poetry, 0, 1)
         opt_grid.addWidget(self.cb_br, 1, 0)
+        opt_grid.addWidget(self.cb_wikisource, 1, 1)
 
         # Preview
         self.preview = QtWidgets.QPlainTextEdit()
@@ -517,6 +577,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status.setText("Pega un URL primero.")
             return
 
+        if self.cb_wikisource.isChecked():
+            self._download_wikisource_work(url)
+            return
+
         self._set_busy(True, "Descargando HTML…")
         QtWidgets.QApplication.processEvents()
 
@@ -535,6 +599,45 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_text = cleaned
         self.preview.setPlainText(cleaned)
         self._set_busy(False, f"Listo. Caracteres: {len(cleaned):,} | Líneas: {cleaned.count(chr(10))}")
+        self.btn_save.setEnabled(True)
+
+    def _download_wikisource_work(self, index_url: str) -> None:
+        self._set_busy(True, "Descargando índice de Wikisource…")
+        QtWidgets.QApplication.processEvents()
+
+        try:
+            data = fetch_url_bytes(index_url)
+        except Exception as e:
+            self._set_busy(False, f"Fallo descargando índice: {e}")
+            return
+
+        html_text = decode_html_bytes(data)
+        chapter_links = extract_wikisource_chapter_links(html_text, index_url)
+        if not chapter_links:
+            self._set_busy(False, "No se encontraron links de capítulos.")
+            return
+
+        chapters: list[str] = []
+        total = len(chapter_links)
+        for idx, link in enumerate(chapter_links, start=1):
+            render_url = _ensure_action_render(link)
+            self._set_busy(True, f"Descargando capítulo {idx}/{total}…")
+            QtWidgets.QApplication.processEvents()
+            try:
+                chapter_bytes = fetch_url_bytes(render_url)
+            except Exception as e:
+                self._set_busy(False, f"Fallo descargando capítulo {idx}: {e}")
+                return
+
+            chapter_html = decode_html_bytes(chapter_bytes)
+            chapter_text = extract_clean_text(chapter_html, self._options())
+            if chapter_text:
+                chapters.append(chapter_text.rstrip())
+
+        combined = "\n\n".join(chapters).strip() + "\n"
+        self._last_text = combined
+        self.preview.setPlainText(combined)
+        self._set_busy(False, f"Wikisource completo. Capítulos: {len(chapters)} | Caracteres: {len(combined):,}")
         self.btn_save.setEnabled(True)
 
     def on_save(self):
