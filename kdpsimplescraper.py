@@ -149,6 +149,7 @@ def select_main_container(soup: BeautifulSoup) -> Tag:
 # ------------------------------
 
 BLOCK_TAGS = ["h1","h2","h3","h4","h5","p","pre","blockquote","ul","ol","hr","div"]
+NESTED_BLOCK_TAGS = ["h1","h2","h3","h4","h5","p","pre","blockquote","ul","ol","hr"]
 
 def extract_clean_text(html_text: str, opt: ExtractOptions) -> str:
     """Convert Gutenberg-ish HTML into clean TXT while preserving structure."""
@@ -239,10 +240,7 @@ def extract_clean_text(html_text: str, opt: ExtractOptions) -> str:
         if name in {"p","div"}:
             # Avoid flattening container divs that hold other blocks directly
             if name == "div":
-                nested = tag.find(
-                    ["p","h1","h2","h3","h4","h5","pre","ul","ol","blockquote"],
-                    recursive=False
-                )
+                nested = tag.find(NESTED_BLOCK_TAGS, recursive=True)
                 if nested is not None:
                     return
 
@@ -420,9 +418,7 @@ def _clean_wikisource_content(html_text: str, opt: ExtractOptions) -> tuple[str,
 
 
 def _format_wikisource_section(title: str, url: str, body: str) -> str:
-    divider = "============================================================"
-    header = f"\n\n{divider}\n{title}\n{url}\n{divider}\n\n"
-    return f"{header}{body.rstrip()}\n"
+    return f"{body.rstrip()}\n\n"
 
 
 def _collect_wikisource_chapters(index_url: str, opt: ExtractOptions) -> list[tuple[str, str, str]]:
